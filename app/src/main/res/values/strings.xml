@@ -6,6 +6,9 @@
     <string name="second_fragment_label">Second Fragment</string>
     <string name="next">Next</string>
     <string name="previous">Previous</string>
+    <!-- 无障碍服务相关 -->
+    <string name="accessibility_service_label">语音滑动抖音</string>
+    <string name="accessibility_service_description">通过语音指令自动滑动抖音视频，无需触碰屏幕</string>
 
     <string name="lorem_ipsum">
         Lorem ipsum dolor sit amet, consectetur adipiscing elit. Nam in scelerisque sem. Mauris
