@@ -56,6 +56,27 @@ class VoiceCommandService : Service() {
             "pause",
             "点击"
         )
+        private val DOUBLE_TAP_KEYWORDS = setOf(
+            "双击",
+            "连击",
+            "doubletap",
+            "double",
+            "双点"
+        )
+        private val LIKE_KEYWORDS = setOf(
+            "点赞",
+            "喜欢",
+            "like",
+            "爱心",
+            "点个赞"
+        )
+        private val OPEN_COMMENTS_KEYWORDS = setOf(
+            "评论",
+            "打开评论",
+            "评论区",
+            "看评论",
+            "comments"
+        )
 
         private const val CHUNK_DURATION_MS = 100
     }
@@ -278,6 +299,24 @@ class VoiceCommandService : Service() {
                 true
             }
 
+            DOUBLE_TAP_KEYWORDS.any { normalized.contains(it) } -> {
+                sendLog("[COMMAND/$source] double_tap_center")
+                sendAccessibilityBroadcast(DouyinAccessibilityService.ACTION_DOUBLE_TAP_CENTER)
+                true
+            }
+
+            LIKE_KEYWORDS.any { normalized.contains(it) } -> {
+                sendLog("[COMMAND/$source] like")
+                sendAccessibilityBroadcast(DouyinAccessibilityService.ACTION_LIKE)
+                true
+            }
+
+            OPEN_COMMENTS_KEYWORDS.any { normalized.contains(it) } -> {
+                sendLog("[COMMAND/$source] open_comments")
+                sendAccessibilityBroadcast(DouyinAccessibilityService.ACTION_OPEN_COMMENTS)
+                true
+            }
+
             else -> false
         }
     }
@@ -379,14 +418,14 @@ class VoiceCommandService : Service() {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle("DouFlow Sherpa Control")
-                .setContentText("Streaming next / previous / pause commands")
+                .setContentText("Streaming next / previous / pause / like commands")
                 .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                 .setOngoing(true)
                 .build()
         } else {
             NotificationCompat.Builder(this)
                 .setContentTitle("DouFlow Sherpa Control")
-                .setContentText("Streaming next / previous / pause commands")
+                .setContentText("Streaming next / previous / pause / like commands")
                 .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                 .setOngoing(true)
                 .setPriority(NotificationCompat.PRIORITY_LOW)

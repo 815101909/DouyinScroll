@@ -18,6 +18,9 @@ class DouyinAccessibilityService : AccessibilityService() {
         const val ACTION_SWIPE_UP = "com.example.douflow.SWIPE_UP"
         const val ACTION_SWIPE_DOWN = "com.example.douflow.SWIPE_DOWN"
         const val ACTION_TAP_CENTER = "com.example.douflow.TAP_CENTER"
+        const val ACTION_DOUBLE_TAP_CENTER = "com.example.douflow.DOUBLE_TAP_CENTER"
+        const val ACTION_LIKE = "com.example.douflow.LIKE"
+        const val ACTION_OPEN_COMMENTS = "com.example.douflow.OPEN_COMMENTS"
         const val TAG = "DouyinA11yService"
 
         val DOUYIN_PACKAGES = setOf(
@@ -30,10 +33,17 @@ class DouyinAccessibilityService : AccessibilityService() {
 
     private val commandReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
+            if (!isDouyinForeground) {
+                Log.w(TAG, "Ignored action outside Douyin/TikTok: ${intent.action}")
+                return
+            }
             when (intent.action) {
                 ACTION_SWIPE_UP -> performSwipe(direction = SwipeDirection.UP)
                 ACTION_SWIPE_DOWN -> performSwipe(direction = SwipeDirection.DOWN)
                 ACTION_TAP_CENTER -> performTapCenter()
+                ACTION_DOUBLE_TAP_CENTER -> performDoubleTapCenter()
+                ACTION_LIKE -> performLikeTap()
+                ACTION_OPEN_COMMENTS -> performOpenCommentsTap()
             }
         }
     }
@@ -46,6 +56,9 @@ class DouyinAccessibilityService : AccessibilityService() {
             addAction(ACTION_SWIPE_UP)
             addAction(ACTION_SWIPE_DOWN)
             addAction(ACTION_TAP_CENTER)
+            addAction(ACTION_DOUBLE_TAP_CENTER)
+            addAction(ACTION_LIKE)
+            addAction(ACTION_OPEN_COMMENTS)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(commandReceiver, filter, RECEIVER_NOT_EXPORTED)
@@ -96,16 +109,60 @@ class DouyinAccessibilityService : AccessibilityService() {
 
     private fun performTapCenter() {
         val displayMetrics = resources.displayMetrics
-        val centerX = displayMetrics.widthPixels / 2f
-        val centerY = displayMetrics.heightPixels / 2f
-        val tapPath = Path().apply {
-            moveTo(centerX, centerY)
-        }
-        val tapStroke = StrokeDescription(tapPath, 0L, 80L)
-        dispatchGestureWithLog(
-            gesture = GestureDescription.Builder().addStroke(tapStroke).build(),
+        dispatchTap(
+            x = displayMetrics.widthPixels / 2f,
+            y = displayMetrics.heightPixels / 2f,
             description = "tap_center"
         )
+    }
+
+    private fun performDoubleTapCenter() {
+        val displayMetrics = resources.displayMetrics
+        val centerX = displayMetrics.widthPixels / 2f
+        val centerY = displayMetrics.heightPixels / 2f
+        val firstTap = tapStroke(centerX, centerY, startTime = 0L)
+        val secondTap = tapStroke(centerX, centerY, startTime = 180L)
+        dispatchGestureWithLog(
+            gesture = GestureDescription.Builder()
+                .addStroke(firstTap)
+                .addStroke(secondTap)
+                .build(),
+            description = "double_tap_center"
+        )
+    }
+
+    private fun performLikeTap() {
+        val displayMetrics = resources.displayMetrics
+        dispatchTap(
+            x = displayMetrics.widthPixels * 0.9f,
+            y = displayMetrics.heightPixels * 0.62f,
+            description = "tap_like"
+        )
+    }
+
+    private fun performOpenCommentsTap() {
+        val displayMetrics = resources.displayMetrics
+        dispatchTap(
+            x = displayMetrics.widthPixels * 0.9f,
+            y = displayMetrics.heightPixels * 0.72f,
+            description = "tap_open_comments"
+        )
+    }
+
+    private fun dispatchTap(x: Float, y: Float, description: String) {
+        dispatchGestureWithLog(
+            gesture = GestureDescription.Builder()
+                .addStroke(tapStroke(x, y, startTime = 0L))
+                .build(),
+            description = description
+        )
+    }
+
+    private fun tapStroke(x: Float, y: Float, startTime: Long): StrokeDescription {
+        val tapPath = Path().apply {
+            moveTo(x, y)
+        }
+        return StrokeDescription(tapPath, startTime, 80L)
     }
 
     private fun dispatchGestureWithLog(gesture: GestureDescription, description: String) {
