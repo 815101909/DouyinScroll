@@ -9,23 +9,26 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
-import android.os.Handler
 import android.os.IBinder
-import android.os.Looper
-import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import com.alibaba.idst.nui.AsrResult
-import com.alibaba.idst.nui.CommonUtils
-import com.alibaba.idst.nui.Constants
-import com.alibaba.idst.nui.INativeNuiCallback
-import com.alibaba.idst.nui.KwsResult
-import com.alibaba.idst.nui.NativeNui
-import org.json.JSONObject
-import java.io.File
+import com.k2fsa.sherpa.onnx.EndpointConfig
+import com.k2fsa.sherpa.onnx.EndpointRule
+import com.k2fsa.sherpa.onnx.FeatureConfig
+import com.k2fsa.sherpa.onnx.OnlineModelConfig
+import com.k2fsa.sherpa.onnx.OnlineRecognizer
+import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig
+import com.k2fsa.sherpa.onnx.OnlineStream
+import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import java.util.Locale
 
-class VoiceCommandService : Service(), INativeNuiCallback {
+class VoiceCommandService : Service() {
 
     companion object {
         const val TAG = "VoiceCommandService"
@@ -34,43 +37,52 @@ class VoiceCommandService : Service(), INativeNuiCallback {
         const val ACTION_LOG = "com.example.douflow.LOG"
         const val EXTRA_LOG = "msg"
 
-        private const val RESTART_DELAY_MS = 800L
-        private val RESTART_TOKEN = Any()
         private val NEXT_KEYWORDS = setOf(
-            "\u4e0b\u4e00\u4e2a",
-            "\u4e0b\u4e00\u6761",
-            "\u4e0b\u4e00\u9875",
+            "下一个",
+            "下一条",
+            "下一页",
             "next",
-            "\u8df3\u8fc7"
+            "跳过"
         )
         private val PREV_KEYWORDS = setOf(
-            "\u4e0a\u4e00\u4e2a",
-            "\u4e0a\u4e00\u6761",
-            "\u4e0a\u4e00\u9875",
+            "上一个",
+            "上一条",
+            "上一页",
             "previous",
-            "\u8fd4\u56de"
+            "返回"
         )
+        private val PAUSE_KEYWORDS = setOf(
+            "暂停",
+            "pause",
+            "点击"
+        )
+
+        private const val CHUNK_DURATION_MS = 100
     }
 
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private val sdkConfig by lazy { VoiceSdkConfig.fromBuildConfig() }
+    private val serviceScope = CoroutineScope(Dispatchers.Default)
+    private val sherpaConfig by lazy { SherpaConfig.fromBuildConfig() }
 
-    private var nuiInstance: NativeNui? = null
+    private var recognizer: OnlineRecognizer? = null
+    private var onlineStream: OnlineStream? = null
     private var audioRecord: AudioRecord? = null
-    private var sdkInitialized = false
-    private var dialogRunning = false
-    private var debugPath: String = ""
+    private var listeningJob: Job? = null
+    private var lastPartialText: String = ""
+    private var handledInCurrentUtterance = false
+    private var stoppedByError = false
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
-        initVoiceSdk()
+        initSherpa()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (sdkInitialized) {
-            startDialogLoop("service_start")
+        if (recognizer != null && listeningJob == null) {
+            listeningJob = serviceScope.launch(Dispatchers.IO) {
+                listenLoop()
+            }
         }
         return START_STICKY
     }
@@ -79,162 +91,237 @@ class VoiceCommandService : Service(), INativeNuiCallback {
 
     override fun onDestroy() {
         VoiceServiceState.isRunning = false
-        dialogRunning = false
-        mainHandler.removeCallbacksAndMessages(RESTART_TOKEN)
+        listeningJob?.cancel()
+        listeningJob = null
         releaseAudioRecord()
-        nuiInstance?.runCatching {
-            cancelDialog()
-            release()
-        }?.onFailure {
-            Log.w(TAG, "release sdk failed", it)
-        }
-        nuiInstance = null
-        sdkInitialized = false
+        onlineStream?.release()
+        onlineStream = null
+        recognizer?.release()
+        recognizer = null
+        serviceScope.cancel()
         super.onDestroy()
     }
 
-    private fun initVoiceSdk() {
-        if (!sdkConfig.isConfigured()) {
-            sendLog("[SDK] Missing voice.sdk.apiKey. Service stopped.")
+    private fun initSherpa() {
+        val modelDir = sherpaConfig.modelDir
+        if (modelDir.isBlank()) {
+            sendLog("[SHERPA] Missing sherpa.model.dir. Service stopped.")
             stopSelf()
             return
         }
 
-        if (!CommonUtils.setTargetDataDir(sdkConfig.workspaceDirName)) {
-            sendLog("[SDK] Failed to set workspace directory.")
-            stopSelf()
-            return
-        }
-
-        if (!CommonUtils.copyAssetsData(this)) {
-            sendLog("[SDK] Failed to copy SDK assets.")
-            stopSelf()
-            return
-        }
-
-        debugPath = File(externalCacheDir ?: cacheDir, "voice-sdk-debug").apply {
-            mkdirs()
-        }.absolutePath
-
-        val nativeNui = NativeNui()
-        val result = nativeNui.initialize(
-            this,
-            buildInitParams(),
-            Constants.LogLevel.LOG_LEVEL_VERBOSE,
-            true
+        val modelFiles = listOf(
+            "$modelDir/tokens.txt",
+            "$modelDir/encoder-epoch-99-avg-1.int8.onnx",
+            "$modelDir/decoder-epoch-99-avg-1.int8.onnx",
+            "$modelDir/joiner-epoch-99-avg-1.int8.onnx"
         )
-        if (result == Constants.NuiResultCode.SUCCESS) {
-            nuiInstance = nativeNui
-            sdkInitialized = true
-            sendLog("[SDK] Initialized. Listening started.")
-            startDialogLoop("sdk_initialized")
-        } else {
-            nativeNui.release()
-            sendLog("[SDK] Initialization failed: $result")
-            stopSelf()
-        }
-    }
 
-    private fun startDialogLoop(reason: String) {
-        if (!sdkInitialized || dialogRunning) return
-        val instance = nuiInstance ?: return
-        if (!ensureAudioRecord()) {
-            sendLog("[SDK] Failed to initialize audio recorder.")
+        val missingFile = modelFiles.firstOrNull { !assetExists(it) }
+        if (missingFile != null) {
+            sendLog("[SHERPA] Model asset not found: $missingFile")
             stopSelf()
             return
         }
 
-        val paramsResult = instance.setParams(buildRecognitionParams())
-        if (paramsResult != Constants.NuiResultCode.SUCCESS) {
-            sendLog("[SDK] Failed to set params: $paramsResult")
-        }
-
-        val startResult = instance.startDialog(Constants.VadMode.TYPE_P2T, buildDialogParams())
-        if (startResult == Constants.NuiResultCode.SUCCESS) {
-            dialogRunning = true
-            sendLog("[SDK] Recognition session started.")
-            Log.i(TAG, "startDialog success, reason=$reason")
-        } else {
-            dialogRunning = false
-            sendLog("[SDK] Failed to start recognition: $startResult")
-            scheduleRestart("start_failed")
-        }
-    }
-
-    private fun scheduleRestart(reason: String) {
-        if (!sdkInitialized) return
-        dialogRunning = false
-        mainHandler.removeCallbacksAndMessages(RESTART_TOKEN)
-        mainHandler.postAtTime(
-            { startDialogLoop(reason) },
-            RESTART_TOKEN,
-            SystemClock.uptimeMillis() + RESTART_DELAY_MS
-        )
-    }
-
-    private fun buildInitParams(): String {
-        return JSONObject().apply {
-            put("device_id", sdkConfig.deviceId(this@VoiceCommandService))
-            put("url", sdkConfig.url)
-            put("apikey", sdkConfig.apiKey)
-            put("save_wav", false)
-            put("debug_path", debugPath)
-            put(
-                "log_track_level",
-                Constants.LogLevel.toInt(Constants.LogLevel.LOG_LEVEL_NONE).toString()
+        try {
+            sendLog("[SHERPA] Loading model: $modelDir")
+            recognizer = OnlineRecognizer(
+                assets,
+                OnlineRecognizerConfig(
+                    featConfig = FeatureConfig(
+                        sampleRate = sherpaConfig.sampleRate,
+                        featureDim = sherpaConfig.featureDim,
+                        dither = 0.0f
+                    ),
+                    modelConfig = OnlineModelConfig(
+                        transducer = OnlineTransducerModelConfig(
+                            encoder = "$modelDir/encoder-epoch-99-avg-1.int8.onnx",
+                            decoder = "$modelDir/decoder-epoch-99-avg-1.int8.onnx",
+                            joiner = "$modelDir/joiner-epoch-99-avg-1.int8.onnx"
+                        ),
+                        tokens = "$modelDir/tokens.txt",
+                        numThreads = sherpaConfig.numThreads,
+                        provider = sherpaConfig.provider,
+                        debug = false
+                    ),
+                    endpointConfig = EndpointConfig(
+                        rule1 = EndpointRule(
+                            mustContainNonSilence = false,
+                            minTrailingSilence = sherpaConfig.rule1MinTrailingSilence,
+                            minUtteranceLength = 0.0f
+                        ),
+                        rule2 = EndpointRule(
+                            mustContainNonSilence = true,
+                            minTrailingSilence = sherpaConfig.rule2MinTrailingSilence,
+                            minUtteranceLength = 0.0f
+                        ),
+                        rule3 = EndpointRule(
+                            mustContainNonSilence = false,
+                            minTrailingSilence = 0.0f,
+                            minUtteranceLength = sherpaConfig.rule3MinUtteranceLength
+                        )
+                    ),
+                    enableEndpoint = sherpaConfig.enableEndpoint,
+                    decodingMethod = sherpaConfig.decodingMethod,
+                    blankPenalty = sherpaConfig.blankPenalty
+                )
             )
-            put("service_mode", Constants.ModeFullCloud)
-        }.toString()
-    }
-
-    private fun buildRecognitionParams(): String {
-        val nlsConfig = JSONObject().apply {
-            put("sample_rate", sdkConfig.sampleRate)
-            put("sr_format", "pcm")
-            put("semantic_punctuation_enabled", false)
-            put("max_sentence_silence", 500)
-            put("multi_threshold_mode_enabled", true)
-            put("heartbeat", true)
-            put("punctuation_prediction_enabled", true)
-            if (sdkConfig.model.isNotBlank()) {
-                put("model", sdkConfig.model)
-            }
+            sendLog("[SHERPA] Ready.")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to initialize Sherpa-ONNX", e)
+            sendLog("[SHERPA] Initialization failed: ${e.message}")
+            stopSelf()
         }
-        return JSONObject().apply {
-            put("nls_config", nlsConfig)
-            put("service_type", Constants.kServiceTypeSpeechTranscriber)
-        }.toString()
     }
 
-    private fun buildDialogParams(): String {
-        return JSONObject().apply {
-            put("apikey", sdkConfig.apiKey)
-        }.toString()
+    private suspend fun listenLoop() {
+        val recognizer = recognizer ?: return
+        val recorder = ensureAudioRecord()
+        if (recorder == null) {
+            sendLog("[SHERPA] Failed to initialize audio recorder.")
+            stopSelf()
+            return
+        }
+
+        val stream = recognizer.createStream()
+        onlineStream = stream
+        val chunkSize = sherpaConfig.sampleRate * CHUNK_DURATION_MS / 1000
+        val shortBuffer = ShortArray(chunkSize)
+
+        try {
+            recorder.startRecording()
+            sendLog("[SHERPA] Listening started.")
+
+            while (listeningJob?.isActive == true && serviceScope.isActive) {
+                val read = recorder.read(shortBuffer, 0, shortBuffer.size)
+                if (read <= 0) {
+                    if (!stoppedByError) {
+                        stoppedByError = true
+                        sendLog("[SHERPA] audioRecord.read returned $read")
+                    }
+                    continue
+                }
+                stoppedByError = false
+
+                stream.acceptWaveform(shortBuffer.toFloatArray(read), sherpaConfig.sampleRate)
+
+                while (recognizer.isReady(stream)) {
+                    recognizer.decode(stream)
+                }
+
+                val currentText = recognizer.getResult(stream).text.trim()
+                handlePartialResult(currentText)
+
+                if (recognizer.isEndpoint(stream)) {
+                    handleEndpointResult(currentText)
+                    recognizer.reset(stream)
+                    lastPartialText = ""
+                    handledInCurrentUtterance = false
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "listenLoop failed", e)
+            sendLog("[SHERPA] Listening failed: ${e.message}")
+        } finally {
+            stream.release()
+            if (onlineStream === stream) {
+                onlineStream = null
+            }
+            releaseAudioRecord()
+        }
     }
 
-    private fun ensureAudioRecord(): Boolean {
-        if (audioRecord != null) return true
-        val minBuffer = AudioRecord.getMinBufferSize(
-            sdkConfig.sampleRate,
+    private fun handlePartialResult(text: String) {
+        if (text.isBlank() || text == lastPartialText) {
+            return
+        }
+
+        lastPartialText = text
+        sendLog("[PARTIAL] $text")
+
+        if (!handledInCurrentUtterance && tryDispatchCommand(text, source = "partial")) {
+            handledInCurrentUtterance = true
+        }
+    }
+
+    private fun handleEndpointResult(text: String) {
+        if (text.isBlank()) {
+            sendLog("[RESULT] <empty>")
+            return
+        }
+
+        sendLog("[RESULT] $text")
+        if (!handledInCurrentUtterance) {
+            handledInCurrentUtterance = tryDispatchCommand(text, source = "final")
+        }
+    }
+
+    private fun tryDispatchCommand(text: String, source: String): Boolean {
+        val normalized = normalizeText(text)
+        return when {
+            NEXT_KEYWORDS.any { normalized.contains(it) } -> {
+                sendLog("[COMMAND/$source] next")
+                sendAccessibilityBroadcast(DouyinAccessibilityService.ACTION_SWIPE_UP)
+                true
+            }
+
+            PREV_KEYWORDS.any { normalized.contains(it) } -> {
+                sendLog("[COMMAND/$source] previous")
+                sendAccessibilityBroadcast(DouyinAccessibilityService.ACTION_SWIPE_DOWN)
+                true
+            }
+
+            PAUSE_KEYWORDS.any { normalized.contains(it) } -> {
+                sendLog("[COMMAND/$source] tap_center")
+                sendAccessibilityBroadcast(DouyinAccessibilityService.ACTION_TAP_CENTER)
+                true
+            }
+
+            else -> false
+        }
+    }
+
+    private fun normalizeText(text: String): String {
+        return text
+            .lowercase(Locale.ROOT)
+            .replace(" ", "")
+            .replace("\n", "")
+            .replace("\u3002", "")
+            .replace("\uff0c", "")
+            .replace(",", "")
+            .replace("\uff01", "")
+            .replace("!", "")
+            .replace("\uff1f", "")
+            .replace("?", "")
+        }
+
+    private fun ensureAudioRecord(): AudioRecord? {
+        audioRecord?.let { return it }
+
+        val minBufferSize = AudioRecord.getMinBufferSize(
+            sherpaConfig.sampleRate,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT
         )
-        if (minBuffer <= 0) return false
+        if (minBufferSize <= 0) {
+            return null
+        }
 
-        val bufferSize = maxOf(minBuffer, sdkConfig.sampleRate / 1000 * 20 * 2 * 4)
         val recorder = AudioRecord(
             MediaRecorder.AudioSource.MIC,
-            sdkConfig.sampleRate,
+            sherpaConfig.sampleRate,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
-            bufferSize
+            maxOf(minBufferSize * 2, sherpaConfig.sampleRate / 2)
         )
         if (recorder.state != AudioRecord.STATE_INITIALIZED) {
             recorder.release()
-            return false
+            return null
         }
+
         audioRecord = recorder
-        return true
+        return recorder
     }
 
     private fun releaseAudioRecord() {
@@ -247,151 +334,22 @@ class VoiceCommandService : Service(), INativeNuiCallback {
         audioRecord = null
     }
 
-    override fun onNuiEventCallback(
-        event: Constants.NuiEvent,
-        resultCode: Int,
-        arg2: Int,
-        kwsResult: KwsResult?,
-        asrResult: AsrResult?
-    ) {
-        Log.i(TAG, "onNuiEventCallback event=$event resultCode=$resultCode arg2=$arg2")
-        when (event) {
-            Constants.NuiEvent.EVENT_TRANSCRIBER_STARTED -> {
-                sendLog("[SDK] Transcriber started.")
-            }
-
-            Constants.NuiEvent.EVENT_VAD_START -> {
-                sendLog("[SDK] Voice activity detected.")
-            }
-
-            Constants.NuiEvent.EVENT_ASR_PARTIAL_RESULT -> {
-                extractText(asrResult)?.takeIf { it.isNotBlank() }?.let {
-                    sendLog("[PARTIAL] $it")
-                }
-            }
-
-            Constants.NuiEvent.EVENT_SENTENCE_END,
-            Constants.NuiEvent.EVENT_ASR_RESULT -> {
-                val text = extractText(asrResult).orEmpty()
-                sendLog("[RESULT] $text")
-                processVoiceCommand(listOf(text))
-            }
-
-            Constants.NuiEvent.EVENT_TRANSCRIBER_COMPLETE -> {
-                dialogRunning = false
-                sendLog("[SDK] Transcriber completed.")
-                scheduleRestart("transcriber_complete")
-            }
-
-            Constants.NuiEvent.EVENT_VAD_TIMEOUT,
-            Constants.NuiEvent.EVENT_ASR_ERROR,
-            Constants.NuiEvent.EVENT_DIALOG_ERROR,
-            Constants.NuiEvent.EVENT_MIC_ERROR,
-            Constants.NuiEvent.EVENT_ONESHOT_TIMEOUT -> {
-                dialogRunning = false
-                val detail = extractText(asrResult).orEmpty()
-                val suffix = if (detail.isBlank()) "" else " $detail"
-                sendLog("[SDK] $event code=$resultCode$suffix")
-                scheduleRestart("retry_event")
-            }
-
-            else -> Unit
+    private fun ShortArray.toFloatArray(read: Int): FloatArray {
+        return FloatArray(read) { index ->
+            this[index] / 32768.0f
         }
     }
 
-    override fun onNuiNeedAudioData(buffer: ByteArray, len: Int): Int {
-        val recorder = audioRecord ?: return -1
-        if (recorder.state != AudioRecord.STATE_INITIALIZED) {
-            return -1
-        }
-        return recorder.read(buffer, 0, len)
-    }
-
-    override fun onNuiAudioStateChanged(state: Constants.AudioState) {
-        when (state) {
-            Constants.AudioState.STATE_OPEN -> {
-                if (!ensureAudioRecord()) {
-                    sendLog("[SDK] Failed to open audio recorder.")
-                    return
-                }
-                sendLog("[SDK] Audio recorder opened.")
-                audioRecord?.runCatching {
-                    if (recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-                        startRecording()
-                    }
-                }
-            }
-
-            Constants.AudioState.STATE_PAUSE -> {
-                sendLog("[SDK] Audio recorder paused.")
-                audioRecord?.runCatching {
-                    if (recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                        stop()
-                    }
-                }
-            }
-
-            Constants.AudioState.STATE_CLOSE -> {
-                sendLog("[SDK] Audio recorder closed.")
-                releaseAudioRecord()
-            }
+    private fun assetExists(path: String): Boolean {
+        return try {
+            assets.open(path).close()
+            true
+        } catch (_: Exception) {
+            false
         }
     }
 
-    override fun onNuiAudioRMSChanged(valume: Float) = Unit
-
-    override fun onNuiVprEventCallback(event: Constants.NuiVprEvent) = Unit
-
-    override fun onNuiLogTrackCallback(level: Constants.LogLevel, log: String) {
-        Log.d(TAG, "sdk[$level] $log")
-    }
-
-    private fun extractText(asrResult: AsrResult?): String? {
-        if (asrResult == null) return null
-        val fullResponse = asrResult.allResponse.orEmpty()
-        if (fullResponse.isNotBlank()) {
-            runCatching {
-                val payload = JSONObject(fullResponse).optJSONObject("payload")
-                payload?.optString("result").orEmpty()
-            }.getOrNull()?.takeIf { it.isNotBlank() }?.let { return it }
-        }
-        return asrResult.asrResult?.takeIf { it.isNotBlank() }
-    }
-
-    private fun processVoiceCommand(results: List<String>) {
-        for (text in results) {
-            val normalized = normalizeText(text)
-            when {
-                NEXT_KEYWORDS.any { normalized.contains(it) } -> {
-                    sendLog("[COMMAND] next")
-                    sendSwipeBroadcast(DouyinAccessibilityService.ACTION_SWIPE_UP)
-                    return
-                }
-
-                PREV_KEYWORDS.any { normalized.contains(it) } -> {
-                    sendLog("[COMMAND] previous")
-                    sendSwipeBroadcast(DouyinAccessibilityService.ACTION_SWIPE_DOWN)
-                    return
-                }
-            }
-        }
-        sendLog("[COMMAND] ignored")
-    }
-
-    private fun normalizeText(text: String): String {
-        return text
-            .lowercase(Locale.ROOT)
-            .replace(" ", "")
-            .replace("\u3002", "")
-            .replace("\uff0c", "")
-            .replace(",", "")
-            .replace("\uff01", "")
-            .replace("!", "")
-            .replace("\uff1f", "")
-            .replace("?", "")
-    }
-
-    private fun sendSwipeBroadcast(action: String) {
+    private fun sendAccessibilityBroadcast(action: String) {
         sendBroadcast(Intent(action).setPackage(packageName))
     }
 
@@ -411,7 +369,7 @@ class VoiceCommandService : Service(), INativeNuiCallback {
                 "Voice Command Listener",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Voice SDK foreground service"
+                description = "Sherpa-ONNX foreground service"
             }
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
@@ -420,15 +378,15 @@ class VoiceCommandService : Service(), INativeNuiCallback {
     private fun buildNotification(): Notification {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
-                .setContentTitle("DouFlow Voice Control")
-                .setContentText("Listening for next/previous commands")
+                .setContentTitle("DouFlow Sherpa Control")
+                .setContentText("Streaming next / previous / pause commands")
                 .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                 .setOngoing(true)
                 .build()
         } else {
             NotificationCompat.Builder(this)
-                .setContentTitle("DouFlow Voice Control")
-                .setContentText("Listening for next/previous commands")
+                .setContentTitle("DouFlow Sherpa Control")
+                .setContentText("Streaming next / previous / pause commands")
                 .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                 .setOngoing(true)
                 .setPriority(NotificationCompat.PRIORITY_LOW)

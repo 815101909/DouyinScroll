@@ -41,18 +41,8 @@ android {
 
         buildConfigField(
             "String",
-            "VOICE_SDK_API_KEY",
-            "\"${project.resolveVoiceSdkProperty("voice.sdk.apiKey")}\""
-        )
-        buildConfigField(
-            "String",
-            "VOICE_SDK_URL",
-            "\"${project.resolveVoiceSdkProperty("voice.sdk.url", "wss://dashscope.aliyuncs.com/api-ws/v1/inference")}\""
-        )
-        buildConfigField(
-            "String",
-            "VOICE_SDK_MODEL",
-            "\"${project.resolveVoiceSdkProperty("voice.sdk.model", "fun-asr-realtime")}\""
+            "SHERPA_MODEL_DIR",
+            "\"${project.resolveVoiceSdkProperty("sherpa.model.dir", "models/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23")}\""
         )
     }
 
@@ -86,8 +76,8 @@ dependencies {
     implementation(libs.androidx.constraintlayout)
     implementation(libs.androidx.navigation.fragment.ktx)
     implementation(libs.androidx.navigation.ui.ktx)
-    compileOnly(files("libs/nuisdk-classes.jar"))
-    implementation(mapOf("name" to "nuisdk-release", "ext" to "aar"))
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.2")
+    implementation(mapOf("name" to "sherpa-onnx-1.12.20", "ext" to "aar"))
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

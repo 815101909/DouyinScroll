@@ -8,6 +8,4 @@
 # For customization when using a Version Control System, please read the
 # header note.
 sdk.dir=C\:\\Users\\yourname\\AppData\\Local\\Android\\Sdk
-voice.sdk.apiKey=your_api_key
-voice.sdk.url=wss://dashscope.aliyuncs.com/api-ws/v1/inference
-voice.sdk.model=fun-asr-realtime
+sherpa.model.dir=models/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23

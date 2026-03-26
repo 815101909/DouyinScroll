@@ -6,11 +6,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.provider.Settings
 import android.view.accessibility.AccessibilityManager
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
@@ -127,12 +126,15 @@ class MainActivity : AppCompatActivity() {
 
     private fun isAccessibilityServiceEnabled(): Boolean {
         val am = getSystemService(ACCESSIBILITY_SERVICE) as AccessibilityManager
-        val enabledServices = Settings.Secure.getString(
-            contentResolver,
-            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
-        ) ?: return false
-        val serviceName = "$packageName/${DouyinAccessibilityService::class.java.name}"
-        return enabledServices.contains(serviceName)
+        val enabledServices = am.getEnabledAccessibilityServiceList(
+            AccessibilityServiceInfo.FEEDBACK_ALL_MASK
+        )
+        val expectedServiceId = "$packageName/${DouyinAccessibilityService::class.java.name}"
+        return enabledServices.any { serviceInfo ->
+            serviceInfo.resolveInfo?.serviceInfo?.let { resolvedService ->
+                "${resolvedService.packageName}/${resolvedService.name}" == expectedServiceId
+            } == true
+        }
     }
 
     private fun showAccessibilityGuideDialog() {
@@ -148,7 +150,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun openAccessibilitySettings() {
-        val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+        val intent = Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
         accessibilitySettingsLauncher.launch(intent)
     }
 
